@@ -17,7 +17,6 @@ namespace Microsoft.Forge.TreeWalker
     using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
-
     using Microsoft.Forge.Attributes;
     using Microsoft.Forge.DataContracts;
     using Microsoft.Forge.TreeWalker.ForgeExceptions;
@@ -89,13 +88,13 @@ namespace Microsoft.Forge.TreeWalker
         ///     Ex) C#|"expression"
         ///     Ex) C#<Boolean>|"expression"
         /// </summary>
-        private static Regex RoslynRegex = new Regex(@"^C#(\<(.+)\>)?\|");
+        private static readonly Regex RoslynRegex = new Regex(@"^C#(\<(.+)\>)?\|");
 
         /// <summary>
         /// The leading text to add to Schema strings to indicate the property value should be evaluated with Roslyn.
         /// The property value must match the RoslynRegex to be evaluated with Roslyn.
         /// </summary>
-        private static string RoslynLeadingText = "C#";
+        private static readonly string RoslynLeadingText = "C#";
 
         /// <summary>
         /// The TreeWalkerParameters contains the required and optional properties used by the TreeWalkerSession.
@@ -116,12 +115,12 @@ namespace Microsoft.Forge.TreeWalker
         /// The WalkTree cancellation token source.
         /// Used to send cancellation signal to action tasks and to stop tree walker from visiting future nodes.
         /// </summary>
-        private CancellationTokenSource walkTreeCts;
+        private readonly CancellationTokenSource walkTreeCts;
 
         /// <summary>
         /// The ExpressionExecutor dynamically compiles code and executes it.
         /// </summary>
-        private ExpressionExecutor expressionExecutor;
+        private readonly ExpressionExecutor expressionExecutor;
 
         /// <summary>
         /// The map of string ActionNames to ActionDefinitions.
@@ -129,7 +128,7 @@ namespace Microsoft.Forge.TreeWalker
         /// The string key is the Action class name.
         /// The ActionDefinition value contains the Action class type, and the InputType for the Action.
         /// </summary>
-        private Dictionary<string, ActionDefinition> actionsMap;
+        private readonly Dictionary<string, ActionDefinition> actionsMap;
 
         /// <summary>
         /// Volatile flag to determine if we are visiting a node normally, or upon rehydration.
@@ -795,25 +794,21 @@ namespace Microsoft.Forge.TreeWalker
                         return;
                     }
 
-                    break;
+                    // Retries are exhausted. Throw ActionTimeoutException with executeAction exception as innerException.
+                    throw new ActionTimeoutException(
+                        string.Format(
+                            "Action did not complete successfully with retry attempts exhausted. TreeNodeKey: {0}, TreeActionKey: {1}, ActionName: {2}, RetryCount: {3}, RetryPolicy: {4}",
+                            treeNodeKey,
+                            treeActionKey,
+                            treeAction.Action,
+                            retryCount,
+                            retryPolicyType),
+                        innerException);
                 }
 
                 // Break out early if we would hit timeout before next retry.
                 if (actionTimeout != -1 && stopwatch.ElapsedMilliseconds + waitTime.TotalMilliseconds >= actionTimeout)
                 {
-                    // If the timeout is hit and the ContinuationOnTimeout flag is set, commit a new ActionResponse. 
-                    // with the status set to TimeoutOnAction and return.
-                    if (treeAction.ContinuationOnTimeout)
-                    {
-                        ActionResponse timeoutResponse = new ActionResponse
-                        {
-                            Status = "TimeoutOnAction"
-                        };
-
-                        await this.CommitActionResponse(treeActionKey, timeoutResponse).ConfigureAwait(false);
-                        return;
-                    }
-
                     break;
                 }
 
@@ -823,15 +818,32 @@ namespace Microsoft.Forge.TreeWalker
                 maxRetryCount--;
             }
 
-            // Retries are exhausted. Throw ActionTimeoutException with executeAction exception as innerException.
+            if (actionTimeout != -1 && stopwatch.ElapsedMilliseconds + waitTime.TotalMilliseconds >= actionTimeout)
+            {
+                // If the timeout is hit and the ContinuationOnTimeout flag is set, commit a new ActionResponse. 
+                // with the status set to TimeoutOnAction and return.
+                if (treeAction.ContinuationOnTimeout)
+                {
+                    ActionResponse timeoutResponse = new ActionResponse
+                    {
+                        Status = "TimeoutOnAction"
+                    };
+
+                    await this.CommitActionResponse(treeActionKey, timeoutResponse).ConfigureAwait(false);
+                    return;
+                }
+            }
+
+            // Action timeout is reached. Throw ActionTimeoutException with executeAction exception as innerException.
             throw new ActionTimeoutException(
                 string.Format(
-                    "Action did not complete successfully. TreeNodeKey: {0}, TreeActionKey: {1}, ActionName: {2}, RetryCount: {3}, RetryPolicy: {4}",
+                    "Action did not complete successfully with timeout reached. TreeNodeKey: {0}, TreeActionKey: {1}, ActionName: {2}, RetryCount: {3}, RetryPolicy: {4}, Timeout: {5}",
                     treeNodeKey,
                     treeActionKey,
                     treeAction.Action,
                     retryCount,
-                    retryPolicyType),
+                    retryPolicyType,
+                    actionTimeout),
                 innerException);
         }
 
@@ -1090,10 +1102,11 @@ namespace Microsoft.Forge.TreeWalker
         /// <param name="actionResponse">The action response object returned from the action.</param>
         private async Task CommitActionResponse(string treeActionKey, ActionResponse actionResponse)
         {
-            List<KeyValuePair<string, object>> itemsToPersist = new List<KeyValuePair<string, object>>();
-
-            itemsToPersist.Add(new KeyValuePair<string, object>(treeActionKey + ActionResponseSuffix, actionResponse));
-            itemsToPersist.Add(new KeyValuePair<string, object>(LastTreeActionSuffix, treeActionKey));
+            List<KeyValuePair<string, object>> itemsToPersist = new List<KeyValuePair<string, object>>
+            {
+                new KeyValuePair<string, object>(treeActionKey + ActionResponseSuffix, actionResponse),
+                new KeyValuePair<string, object>(LastTreeActionSuffix, treeActionKey)
+            };
 
             await this.Parameters.ForgeState.SetRange(itemsToPersist);
         }
@@ -1116,7 +1129,6 @@ namespace Microsoft.Forge.TreeWalker
                 foreach (KeyValuePair<string, TreeAction> kvp in treeNode.Actions)
                 {
                     string treeActionKey = kvp.Key;
-                    TreeAction treeAction = kvp.Value;
                     ActionResponse actionResponse = await this.GetOutputAsync(treeActionKey).ConfigureAwait(false);
 
                     if (actionResponse == null)
@@ -1181,10 +1193,11 @@ namespace Microsoft.Forge.TreeWalker
         /// <param name="actionsMap">The map of string ActionNames to ActionDefinitions.</param>
         public static void GetActionsMapFromAssembly(Assembly forgeActionsAssembly, out Dictionary<string, ActionDefinition> actionsMap)
         {
-            actionsMap = new Dictionary<string, ActionDefinition>();
-
-            // Add native ForgeActions: SubroutineAction.
-            actionsMap.Add(nameof(SubroutineAction), new ActionDefinition() { ActionType = typeof(SubroutineAction), InputType = typeof(SubroutineInput) });
+            actionsMap = new Dictionary<string, ActionDefinition>
+            {
+                // Add native ForgeActions: SubroutineAction.
+                { nameof(SubroutineAction), new ActionDefinition() { ActionType = typeof(SubroutineAction), InputType = typeof(SubroutineInput) } }
+            };
 
             if (forgeActionsAssembly == null)
             {
